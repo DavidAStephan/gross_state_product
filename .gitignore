@@ -1,0 +1,14 @@
+# ABS spreadsheets are re-downloaded by 01_data.R (readabs)
+data/raw/*
+# ...except the Queensland Treasury workbook, which is no longer on the live QGSO site
+!data/raw/qld/
+# intermediate results, rebuilt by the numbered scripts
+data/processed/
+# R / Quarto / OS clutter
+.Rhistory
+.RData
+.Rproj.user/
+.quarto/
+/report_files/
+/report.html
+.DS_Store

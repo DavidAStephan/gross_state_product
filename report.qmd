@@ -1,0 +1,490 @@
+---
+title: "Quarterly Gross State Product for Australian states and territories"
+subtitle: "Two methods, compared: indicator regression with two-way reconciliation, and a joint state-space model"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    fig-width: 10
+    fig-height: 7
+    df-print: kable
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+source("R/utils.R")
+library(ggplot2)
+library(knitr)
+theme_set(theme_minimal(base_size = 11) + theme(legend.position = "top", panel.grid.minor = element_blank()))
+opts_chunk$set(dpi = 110)
+
+meta <- read_proc("meta"); q_target <- read_proc("q_target"); targets_fy <- read_proc("targets_fy")
+chk_sa <- read_proc("chk_sa"); a_state <- read_proc("a_state"); a_gap <- read_proc("a_gap")
+ind_diag <- read_proc("ind_diag"); dd <- read_proc("data_dictionary")
+a_diag <- read_proc("method_a_diag"); chosen <- read_proc("method_a_chosen"); oos <- read_proc("oos_prelim")
+b_diag <- read_proc("method_b_diag"); v <- read_proc("validation"); MFVAR_RT_n <- 1500; target_method <- read_proc("target_method")
+out <- readr::read_csv(file.path(DIR_OUT, "quarterly_gsp.csv"), show_col_types = FALSE) |>
+  mutate(state = factor(state, STATES))
+lab_m <- c(method_a = "Method A", method_b = "Method B", method_c = "Method C (MF-VAR)", method_a_prelim = "Method A before reconciliation",
+           baseline_prorata = "Baseline: pro-rata on SFD", baseline_denton = "Baseline: Denton on SFD")
+lab_b <- c(cvm = "Chain volume", current = "Current prices")
+qlab <- function(d) paste(month.abb[as.integer(format(d, "%m"))], format(d, "%Y"))
+last_q <- max(out$quarter); n_unb <- sum(!q_target$benchmarked[q_target$basis == "cvm"])
+num <- function(x, d = 2) formatC(x, format = "f", digits = d)
+rt_overall <- v$rt_sum |> filter(state == "Mean of 8")
+rtv <- function(m, b) num(rt_overall$mae[rt_overall$method == m & rt_overall$basis == b])
+has_c <- "method_c" %in% out$method
+c_diag <- if (has_c) read_proc("method_c_diag") else NULL
+col_m <- c(method_a = "#1b6ca8", method_b = "#e07b39", method_c = "#3a9a5c", baseline_denton = "grey55")
+```
+
+## Summary
+
+- The pipeline produces seasonally adjusted quarterly GSP for all eight states and territories from the September quarter 1989 to the **`r qlab(last_q)` quarter**, in current prices and chain volume measures. Annual benchmarks run to `r meta$last_bench_fy - 1`-`r substr(meta$last_bench_fy, 3, 4)`; the latest **`r n_unb` quarters are unbenchmarked nowcasts**.
+- Both methods estimate the *gap* (GSP minus state final demand) and add it to published SFD. Both satisfy the two accounting constraints to machine precision: four quarters sum to annual GSP, and states sum to the national target every quarter (`r sum(v$tests$passed)` automated checks pass, `r sum(v$tests$failed)` fail).
+- In the pseudo real-time test over `r min(v$test_years)`–`r max(v$test_years)`, the mean absolute error of the implied annual GSP (average of the eight states) was **`r rtv("method_a", "cvm")`% for Method A and `r rtv("method_b", "cvm")`% for Method B in volume terms**, against `r rtv("baseline_denton", "cvm")`% for Denton on SFD; in current prices `r rtv("method_a", "current")`%, `r rtv("method_b", "current")`% and `r rtv("baseline_denton", "current")`%. The two methods are about equally accurate and both roughly halve the baseline error.
+- **Recommendation:** publish Method A as the headline series and use Method B alongside it for uncertainty bands and as a cross-check ([details](#recommendation)). Treat quarterly movements for the Northern Territory and the ACT, and all current-price movements for the mining states, as indicative only.
+- Things you should know before relying on the numbers are collected under [Judgement calls and caveats](#judgement-calls-and-caveats). The most important: seasonally adjusted quarters do **not** sum to the annual figures in current prices, state trade data cover goods only, and the Queensland cross-check shows only moderate agreement on quarterly growth.
+
+## Data
+
+All ABS data are downloaded with `readabs`. Every series used is listed with its table and series ID in `output/data_dictionary.csv` (`r nrow(dd)` series).
+
+```{r}
+dd |> mutate(what = sub(":.*$", "", concept)) |> group_by(Catalogue = catalogue, Table = table) |>
+  summarise(Series = n(), Concepts = paste(unique(what), collapse = "; "), From = format(min(first_obs), "%b %Y"),
+            To = format(max(last_obs), "%b %Y"), .groups = "drop") |>
+  mutate(Table = substr(Table, 1, 70)) |> kable(caption = "ABS tables used")
+```
+
+What could not be sourced as asked:
+
+- **State trade is goods only, unadjusted and in current prices.** The ABS publishes monthly merchandise exports and imports by state (5368.0 tables 15a, 15b) but no quarterly services trade by state and no seasonally adjusted or volume state trade series. The pipeline seasonally adjusts the monthly series itself (robust STL), sums to quarters, and for the volume models deflates by the national goods-and-services export and import deflators. That deflator is a poor fit for states whose export mix differs from the nation's.
+- **Hours worked for the NT and ACT are trend, not seasonally adjusted** (the ABS publishes only trend for the territories).
+- **No separate state mining or farm output indicators are used.** No timely quarterly state-level mining or farm *output* series is available through the ABS time series tables; mining and agriculture enter through the production-side indicator (national industry value added weighted by state shares) and through state goods exports.
+- **National industry value added in current prices starts in September 2002** (5206.0 table 45). Before then the current-price production indicator is back-cast from the volume indicator and the national GDP deflator.
+- **Queensland Treasury's quarterly state accounts are no longer on the live QGSO site.** The workbook used is `r v$qld_file` (`r if (grepl('202009', v$qld_file)) 'the last issue before publication was suspended, retrieved from the Internet Archive copy of the original QGSO file' else 'retrieved from the QGSO archive site'`); it ends in the `r qlab(max(v$qld$series$date))` quarter and is an old vintage.
+
+### Do seasonally adjusted quarters sum to the annual figures?
+
+Not always. The table shows the gap between the sum of four seasonally adjusted quarters and the annual figure in the state accounts.
+
+```{r}
+chk_sa |> group_by(Series = series, `Price basis` = lab_b[basis]) |>
+  summarise(`Max abs gap (%)` = max(abs(sa_vs_annual_pct)), `Mean abs gap (%)` = mean(abs(sa_vs_annual_pct)),
+            `Worst case` = paste(state[which.max(abs(sa_vs_annual_pct))], fy[which.max(abs(sa_vs_annual_pct))]),
+            `Latest year gap, largest (%)` = max(abs(sa_vs_annual_pct[fy == max(fy)])),
+            `Years or state-years out by more than 1e-6` = paste(sum(abs(sa_vs_annual_pct) > 100 * TOL), "of", n()), .groups = "drop") |>
+  kable(digits = 3, caption = "Sum of four seasonally adjusted quarters versus the annual figure")
+```
+
+- **National GDP, volumes:** seasonally adjusted quarters sum to the annual figure in every year except the latest benchmark year, where the quarterly accounts are a newer vintage than the annual state accounts.
+- **National GDP, current prices:** the ABS does not force seasonally adjusted current-price quarters to annual totals, so there is a small gap in every year. The unadjusted quarters do sum to the annual figure (apart from the latest year).
+- **State final demand:** the same pattern, larger for the small states.
+
+**Fix applied (please confirm you are happy with it).** (1) The national quarterly series is benchmarked to the annual sum of the states, which removes the national gap together with the chain-volume non-additivity (next section). (2) The annual gap for each state is defined as annual GSP minus the sum of the four seasonally adjusted SFD quarters actually used, so quarterly SFD plus quarterly gap sums exactly to annual GSP; the small SFD discrepancy is absorbed into the gap. Neither published SFD nor annual GSP is altered.
+
+### Are the two constraint sets mutually consistent?
+
+Each year, the sum of the eight states' annual GSP must equal the sum of the four quarterly national totals, otherwise no set of estimates can satisfy both constraints.
+
+```{r}
+targets_fy |> group_by(`Price basis` = lab_b[basis]) |>
+  summarise(`Raw inconsistency, max abs (%)` = max(abs(raw_inconsistency_pct)),
+            `mean abs (%)` = mean(abs(raw_inconsistency_pct)),
+            `of which: states vs national annual, max abs (%)` = 100 * max(abs(k_nonadd - 1)),
+            `of which: annual vs sum of SA quarters, max abs (%)` = 100 * max(abs(k_sa - 1)),
+            `Year-to-year change in the ratio, mean abs (%)` = mean(abs(k_step_pct), na.rm = TRUE),
+            `max abs (%)` = max(abs(k_step_pct), na.rm = TRUE)) |>
+  kable(digits = 3, caption = "Sum of state annual GSP versus sum of four national seasonally adjusted quarters, before adjustment")
+```
+
+- **Current prices** are consistent between states and the nation (state GSP sums to GDP); the only inconsistency is the seasonal adjustment gap above.
+- **Chain volumes** are not additive. The sum of state annual volumes differs from national annual volume by up to `r num(100 * max(abs(targets_fy$k_nonadd[targets_fy$basis == "cvm"] - 1)))`% (it is zero in the reference year and grows with distance from it).
+
+The national quarterly target is national GDP multiplied by the ratio (sum of state annual GSP ÷ national total for the year). After this adjustment the two constraint sets agree to better than 1e-9 in every year.
+
+```{r}
+#| fig-height: 3.2
+q_target |> ggplot(aes(date)) +
+  geom_step(aes(y = 100 * (k_prorata - 1), colour = "Per-year ratio (literal definition)"), direction = "vh") +
+  geom_line(aes(y = 100 * (k - 1), colour = "Ratio used")) +
+  facet_wrap(~basis, labeller = as_labeller(lab_b), scales = "free_y") +
+  scale_colour_manual(values = c("grey55", "#1b6ca8")) +
+  labs(x = NULL, y = "Adjustment to national GDP (%)", colour = NULL,
+       title = "Adjustment applied to national quarterly GDP to form the cross-sectional target")
+```
+
+**Judgement call: the ratio is interpolated smoothly rather than stepped each July** (setting: `GSP_TARGET=`**`r target_method`**). Applying a different ratio to each financial year puts a step into the national target between each June and September quarter (mean `r num(mean(abs(targets_fy$k_step_pct[targets_fy$basis == "cvm"]), na.rm = TRUE))`%, maximum `r num(max(abs(targets_fy$k_step_pct[targets_fy$basis == "cvm"]), na.rm = TRUE))`% in volumes), which every state's September-quarter growth would inherit. The default instead uses a proportional Denton benchmark of national GDP to the annual sums of the states: annual totals are identical to the per-year definition, but the ratio changes gradually. The two targets never differ by more than `r num(100 * max(abs(q_target$k / q_target$k_prorata - 1)), 3)`% in any quarter. Run with `GSP_TARGET=prorata` for the literal per-year definition. Unbenchmarked quarters carry the last ratio forward.
+
+## Method in plain language
+
+**The gap.** GSP = SFD + gap, where the gap is net international and interstate trade, inventories and the statistical discrepancy. SFD is published quarterly, so only the gap is estimated. The gap is far from small: it averages `r num(100 * mean(a_gap$gap_share[a_gap$state == "WA" & a_gap$basis == "cvm"]), 0)`% of GSP in Western Australia and `r num(100 * mean(a_gap$gap_share[a_gap$state == "ACT" & a_gap$basis == "cvm"]), 0)`% in the ACT (volumes).
+
+**Indicators.** For each state and price basis:
+
+- *Production indicator*: national quarterly industry value added (20 industries) weighted by the state's share of each industry in the **previous** financial year, so the latest quarters use no information that would not have been available. The indicator is chain-linked across financial years (see caveats). `prodgap` = production indicator − SFD is a direct, if noisy, proxy for the gap.
+- Goods exports, goods imports and their difference (`nx`); compensation of employees; hours worked.
+
+```{r}
+ind_diag |> transmute(State = factor(state, STATES), basis = lab_b[basis], cor_gsp_prod, cor_gsp_sfd) |>
+  pivot_wider(names_from = basis, values_from = c(cor_gsp_prod, cor_gsp_sfd)) |> arrange(State) |>
+  kable(digits = 2, col.names = c("State", "Production indicator: volume", "current", "SFD: volume", "current"),
+        caption = "Correlation of annual GSP growth with annual growth in the production indicator and in SFD")
+```
+
+**Baselines.** Pro-rata (quarterly SFD scaled by the annual GSP-to-SFD ratio) and Denton (the same idea with a smoothly varying ratio), each then scaled so the states sum to the national target. They ignore everything except SFD and, after scaling, do not sum exactly to annual GSP. They are yardsticks only.
+
+**Method A: regression, then reconciliation.**
+
+1. *Preliminary estimates.* The annual gap is distributed across quarters by regression on the quarterly indicators (Fernández, Chow-Lin or Litterman, which differ in how persistent the regression error is assumed to be), plus a pooled version with common coefficients across states. There are `r length(unique(oos$model))` candidate models per state. The model used for each state is the one with the lowest out-of-sample error over the previous `r a_diag$SEL_WINDOW` years: for each year, the model is estimated without that year's annual GSP and its implied annual total is compared with the outcome.
+2. *Reconciliation.* The preliminary estimates do not add to the national total. GSP levels (not gaps) are adjusted to meet both constraints while changing each state's quarter-to-quarter proportional movements as little as possible (Di Fonzo–Marini). States whose preliminary estimates are noisier absorb more of the adjustment. One constraint per benchmark year is redundant (`r a_diag$recon$n_dropped[1]` of `r a_diag$recon$n_constraints[1]`); the redundant rows are removed after confirming the totals agree, and are checked on the solution.
+
+**Method B: one model for all states.** A state-space model treats each state's quarterly gap (as a share of its SFD) as an unobserved series that moves as a random walk, with part of each quarter's movement shared across states through a common factor. Two indicators (`prodgap` and `nx`, as shares of SFD) are noisy readings of each gap, each with its own slowly drifting error. The annual gap is observed exactly each June quarter and the national gap is observed exactly every quarter, so the smoothed estimates satisfy both constraints by construction, and the model gives a probability band around each quarter. Parameters are estimated by maximum likelihood (state by state, then the common-factor loadings jointly).
+
+**Method C (alternate): mixed-frequency VAR with stochastic volatility (MF-VAR-SV).** Follows Koop, McIntyre, Mitchell and Poon (2020). National growth and the eight states' quarterly growth form one VAR with seven lags. Each state's equation also contains its own SFD growth and hours-worked growth. Shock variances drift over time (stochastic volatility), and a Dirichlet-Laplace shrinkage prior decides which of the roughly 590 coefficients matter. What is observed is national growth every quarter, annual state growth (a weighted sum of seven quarterly growth rates) and a cross-sectional restriction tying national growth to state growth. The model is estimated by Gibbs sampling, and it is the only one of the three that carries parameter uncertainty into its bands. Because a growth-rate model cannot meet level constraints exactly, every posterior draw is converted to levels and passed through Method A's reconciliation step, so the published mean and every draw satisfy both constraints. See [Method C](#method-c) for results and how it differs from the paper.
+
+## Results
+
+Shaded areas are the unbenchmarked quarters. The band is Method B's 90% interval.
+
+```{r}
+unb <- q_target |> filter(!benchmarked, basis == "cvm") |> summarise(xmin = min(date) - 45, xmax = max(date) + 45)
+plot_levels <- function(b, from = "2018-09-01") {
+  d <- out |> filter(price_basis == b, method %in% c("method_a", "method_b"), quarter >= as.Date(from))
+  ggplot(d, aes(quarter)) +
+    annotate("rect", xmin = unb$xmin, xmax = unb$xmax, ymin = -Inf, ymax = Inf, fill = "grey60", alpha = 0.2) +
+    geom_ribbon(data = filter(d, method == "method_b"), aes(ymin = lower_90 / 1000, ymax = upper_90 / 1000), fill = "#e07b39", alpha = 0.25) +
+    geom_line(aes(y = estimate / 1000, colour = method), linewidth = 0.6) +
+    facet_wrap(~state, scales = "free_y", ncol = 4) +
+    scale_colour_manual(values = c(method_a = "#1b6ca8", method_b = "#e07b39"), labels = lab_m) +
+    labs(x = NULL, y = "$ billion per quarter", colour = NULL, title = paste("Quarterly GSP,", tolower(lab_b[b])))
+}
+plot_growth <- function(b, from = "2015-09-01") {
+  d <- v$growth |> filter(basis == b, method %in% c("method_a", "method_b"), date >= as.Date(from)) |>
+    mutate(state = factor(state, STATES))
+  ggplot(d, aes(date, growth, colour = method)) +
+    annotate("rect", xmin = unb$xmin, xmax = unb$xmax, ymin = -Inf, ymax = Inf, fill = "grey60", alpha = 0.2) +
+    geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) + geom_line(linewidth = 0.5) +
+    facet_wrap(~state, ncol = 4) +
+    scale_colour_manual(values = c(method_a = "#1b6ca8", method_b = "#e07b39"), labels = lab_m) +
+    # axis cut so the 2020 swings do not flatten ordinary quarters
+    coord_cartesian(ylim = if (b == "cvm") c(-4, 5) else c(-7, 9)) +
+    labs(x = NULL, y = "Per cent", colour = NULL, title = paste("Quarterly growth in GSP,", tolower(lab_b[b])),
+         subtitle = "Vertical axis cut to the range of ordinary quarters; the 2020 swings run off the scale")
+}
+plot_levels("cvm")
+```
+
+```{r}
+plot_growth("cvm")
+```
+
+```{r}
+plot_levels("current")
+```
+
+```{r}
+plot_growth("current")
+```
+
+### Latest quarters
+
+```{r}
+v$growth |> filter(method %in% c("method_a", "method_b"), basis == "cvm", date > max(date) - 500) |>
+  transmute(State = factor(state, STATES), Quarter = factor(qlab(date), unique(qlab(sort(date)))), method = lab_m[method], growth) |>
+  pivot_wider(names_from = c(Quarter, method), values_from = growth, names_sep = ": ") |> arrange(State) |>
+  kable(digits = 1, caption = "Quarterly growth in chain volume GSP, per cent, latest six quarters")
+```
+
+```{r}
+out |> filter(method == "method_b", price_basis == "cvm", quarter == last_q) |> arrange(state) |>
+  transmute(State = state, `Estimate ($m)` = estimate, `68% low` = lower_68, `68% high` = upper_68,
+            `90% low` = lower_90, `90% high` = upper_90, `90% half-width (% of level)` = 100 * (upper_90 - estimate) / estimate) |>
+  kable(digits = c(0, 0, 0, 0, 0, 0, 1), format.args = list(big.mark = ","),
+        caption = paste("Method B nowcast for the", qlab(last_q), "quarter, chain volume"))
+```
+
+### The implied gap
+
+```{r}
+#| fig-height: 5.5
+v$gap_share |> filter(basis == "cvm") |> mutate(state = factor(state, STATES)) |>
+  ggplot(aes(date, gap_share_pct, colour = method)) + geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) +
+  geom_line(linewidth = 0.4) + facet_wrap(~state, scales = "free_y", ncol = 4) +
+  scale_colour_manual(values = c(method_a = "#1b6ca8", method_b = "#e07b39"), labels = lab_m) +
+  labs(x = NULL, y = "Per cent of GSP", colour = NULL, title = "Implied gap (GSP − SFD) as a share of GSP, chain volume")
+```
+
+```{r}
+v$gap_sum |> filter(method == "method_a") |> mutate(State = factor(state, STATES), basis = lab_b[basis]) |> arrange(basis, State) |>
+  select(`Price basis` = basis, State, Mean = mean, Min = min, Max = max, Latest = latest, `Largest one-quarter change (ppt)` = max_abs_qtr_change_ppt) |>
+  kable(digits = 1, caption = "Method A: implied gap as a per cent of GSP")
+```
+
+The gap is large and negative for the ACT and Tasmania (they absorb more than they produce) and large and positive for Western Australia. Large one-quarter swings in the gap share for the NT and ACT mostly mirror lumpy investment in SFD (for example imported LNG plant or defence equipment), which the gap offsets.
+
+## Validation
+
+### Constraints
+
+```{r}
+v$tests |> transmute(Test = test, Passed = passed, Failed = failed) |> kable(caption = "Automated tests (testthat)")
+```
+
+Baselines are not tested: after scaling to the national total they miss annual GSP by up to about 0.07%.
+
+### Pseudo real-time test
+
+For each year from `r min(v$test_years)` to `r max(v$test_years)`, that year's annual GSP (and all later data) is withheld, every method is re-estimated, and the sum of its four quarterly estimates is compared with the published annual figure. For Method A the model choice for each state is also made using only out-of-sample errors that would have been known at the time; Method B's parameters are re-estimated each year. This uses today's data vintage, not the data as first published, so it understates true real-time errors.
+
+```{r}
+rt_tab <- function(b, stat = "mae") {
+  v$rt_sum |> filter(basis == b) |> mutate(State = factor(state, c(STATES, "Mean of 8", "Sum of states"))) |>
+    select(State, method, value = all_of(stat)) |> mutate(method = factor(lab_m[method], lab_m)) |>
+    arrange(method) |> pivot_wider(names_from = method, values_from = value) |> arrange(State)
+}
+kable(rt_tab("cvm"), digits = 2, caption = "Mean absolute error of implied annual GSP, per cent: chain volume")
+```
+
+```{r}
+kable(rt_tab("current"), digits = 2, caption = "Mean absolute error of implied annual GSP, per cent: current prices")
+```
+
+```{r}
+kable(rt_tab("cvm", "bias"), digits = 2, caption = "Mean error (bias), per cent: chain volume. Positive = estimate too high")
+```
+
+```{r}
+#| fig-height: 5
+v$rt |> filter(method %in% c("method_a", "method_b", "baseline_denton")) |> mutate(state = factor(state, STATES)) |>
+  ggplot(aes(fy, err_pct, colour = method)) + geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) +
+  geom_line(linewidth = 0.4) + geom_point(size = 0.9) + facet_grid(basis ~ state, scales = "free_y", labeller = labeller(basis = lab_b)) +
+  scale_colour_manual(values = c(method_a = "#1b6ca8", method_b = "#e07b39", baseline_denton = "grey55"), labels = lab_m) +
+  scale_x_continuous(breaks = c(2017, 2021, 2025)) +
+  labs(x = "Financial year withheld", y = "Error, per cent of actual", colour = NULL, title = "Pseudo real-time error by year")
+```
+
+Reading the tables:
+
+- Both methods beat the baselines in almost every state, by most where the gap is large and volatile (WA, NT, ACT).
+- The cross-sectional constraint is worth having: reconciliation cuts the error in the *sum of states* from `r num(v$rt_sum$mae[v$rt_sum$state == "Sum of states" & v$rt_sum$method == "method_a_prelim" & v$rt_sum$basis == "cvm"])`% to `r num(v$rt_sum$mae[v$rt_sum$state == "Sum of states" & v$rt_sum$method == "method_a" & v$rt_sum$basis == "cvm"])`% (volumes), though it changes individual state errors only a little.
+- The NT is poorly estimated by every method (errors of several per cent), and Queensland and WA in current prices are sensitive to commodity prices.
+
+**Does Method A's model selection earn its keep?** The next table compares the preliminary error of the model selected in real time with what each fixed model would have achieved if used for every state throughout (average of eight states, same test years).
+
+```{r}
+fixed <- oos |> filter(fy %in% v$test_years) |> group_by(basis, model, state) |> summarise(mae = mean(abs(err_pct)), .groups = "drop") |>
+  group_by(basis, model) |> summarise(mae = mean(mae), .groups = "drop")
+sel <- v$rt_sum |> filter(state == "Mean of 8", method == "method_a_prelim") |> transmute(basis, model = "Selected per state in real time", mae)
+bind_rows(sel, fixed |> group_by(basis) |> slice_min(mae, n = 3), fixed |> filter(model == "fernandez:s1_prodgap"),
+          fixed |> group_by(basis) |> slice_max(mae, n = 1)) |> distinct() |>
+  mutate(basis = lab_b[basis]) |> pivot_wider(names_from = basis, values_from = mae) |>
+  kable(digits = 2, col.names = c("Preliminary model", "Chain volume MAE (%)", "Current prices MAE (%)"),
+        caption = "Selected model versus fixed models (best three, plain Fernández on prodgap, and the worst)")
+```
+
+```{r}
+chosen |> mutate(State = factor(state, STATES), basis = lab_b[basis]) |> arrange(basis, State) |>
+  select(`Price basis` = basis, State, `Model chosen for the production run` = model, `Out-of-sample RMSE (%)` = rmse,
+         `Plain Fernández on prodgap` = rmse_fernandez_s1, `Median candidate` = rmse_median_model) |>
+  kable(digits = 2, caption = "Method A: model chosen per state and its out-of-sample RMSE over the last ten years")
+```
+
+The chosen model differs across states and price bases, and with only ten out-of-sample observations per state the ranking is noisy. Where the selected model is no better than a simple fixed one in the table above, fixing a single specification for all states would be a defensible simplification.
+
+### Queensland Treasury cross-check
+
+Queensland quarterly growth compared with Queensland Treasury's seasonally adjusted quarterly state accounts (`r v$qld_file`), `r qlab(min(v$qld$series$date))` to `r qlab(max(v$qld$series$date))`.
+
+```{r}
+v$qld$stats |> mutate(method = lab_m[method], basis = lab_b[basis]) |>
+  transmute(`Price basis` = basis, Method = method, Correlation = correlation, `Mean abs difference (ppt)` = mean_abs_diff,
+            `Same sign of growth (%)` = same_sign_pct, `Same direction of change in growth (%)` = same_accel_pct,
+            `Treasury turning points` = qt_turning_points, `Matched within one quarter` = matched_within_1q,
+            `Turning points in our series` = our_turning_points) |>
+  kable(digits = c(0, 0, 2, 2, 0, 0, 0, 0, 0), caption = "Queensland quarterly GSP growth versus Queensland Treasury. A turning point is a change in the sign of quarterly growth")
+```
+
+```{r}
+#| fig-height: 4
+v$qld$series |> filter(method == "method_a", date >= as.Date("2005-01-01")) |>
+  pivot_longer(c(growth, qt_growth)) |>
+  ggplot(aes(date, value, colour = name)) + geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) + geom_line(linewidth = 0.5) +
+  facet_wrap(~basis, labeller = as_labeller(lab_b), ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = c(growth = "#1b6ca8", qt_growth = "grey35"), labels = c("Method A", "Queensland Treasury")) +
+  labs(x = NULL, y = "Per cent", colour = NULL, title = "Queensland quarterly GSP growth")
+```
+
+Agreement is **moderate at best**: Queensland Treasury's quarterly growth has a standard deviation of `r num(v$qld$stats$sd_qt_growth[v$qld$stats$basis == "cvm"][1])` ppt in volumes, and our estimates differ from it by `r num(v$qld$stats$mean_abs_diff[v$qld$stats$basis == "cvm" & v$qld$stats$method == "method_a"])` ppt on average. Part of this is vintage: Treasury's series stops in `r format(max(v$qld$series$date), '%Y')` and the annual benchmarks have been revised since. On an annual basis, Treasury's growth rates and today's ABS annual GSP growth have a correlation of `r num(v$qld_annual$annual_growth_correlation[v$qld_annual$basis == "cvm"])` and differ by `r num(v$qld_annual$annual_growth_mean_abs_diff[v$qld_annual$basis == "cvm"])` ppt on average in volumes (`r num(v$qld_annual$annual_growth_mean_abs_diff[v$qld_annual$basis == "current"])` ppt in current prices). The rest reflects genuinely different information: Treasury compiled quarterly state trade in services and interstate trade directly, which this pipeline cannot observe. The practical lesson is that the *within-year quarterly profile* is the weakest part of these estimates.
+
+### Method A versus Method B
+
+A quarter is flagged when the two methods' quarterly growth rates differ by more than `r v$DIVERGE_PPT` percentage point. All flagged quarters are listed in `output/validation_a_vs_b_divergent_quarters.csv`.
+
+```{r}
+v$ab_sum |> mutate(State = factor(state, STATES), basis = lab_b[basis]) |> arrange(basis, State) |>
+  select(`Price basis` = basis, State, Correlation = correlation, `Mean abs difference (ppt)` = mean_abs_diff_ppt,
+         `Max (ppt)` = max_abs_diff_ppt, `Quarters flagged` = n_diverge, `% flagged` = pct_diverge,
+         `Mean abs level difference (%)` = mean_abs_level_diff_pct, `Method A inside B's 90% band (% of quarters)` = a_inside_b90_pct) |>
+  kable(digits = c(0, 0, 2, 2, 1, 0, 0, 2, 0), caption = "Method A versus Method B, quarterly growth and levels")
+```
+
+```{r}
+recent <- v$ab_flags |> filter(quarter > last_q - 365 * 3)
+```
+
+The two methods agree closely for New South Wales, Victoria and (in volumes) Queensland, and poorly for the ACT and NT. Over the last three years `r nrow(recent)` state-quarters are flagged (`r nrow(filter(recent, basis == "cvm"))` in volumes); the most recent are below.
+
+```{r}
+v$ab_flags |> arrange(desc(quarter)) |> head(12) |>
+  transmute(`Price basis` = lab_b[basis], State = state, Quarter = qlab(quarter), `Method A growth` = growth_method_a,
+            `Method B growth` = growth_method_b, `Difference (ppt)` = diff_ppt, Benchmarked = ifelse(benchmarked, "yes", "no")) |>
+  kable(digits = 1, caption = "Most recent quarters where the methods diverge")
+```
+
+### Sanity checks
+
+Quarters with growth beyond ±`r v$GROWTH_FLAG`% (full list in `output/sanity_growth_flags.csv`):
+
+```{r}
+ctx <- v$flags |> filter(method %in% c("method_a", "method_b")) |>
+  left_join(v$sfd_g, by = c("basis", "state", "quarter" = "date")) |>
+  group_by(basis, method, state) |> summarise(n = n(), sfd_big = sum(abs(sfd_growth) > v$GROWTH_FLAG), .groups = "drop")
+ctx |> mutate(cell = paste0(n, " (", sfd_big, ")"), State = factor(state, STATES), col = paste(lab_m[method], lab_b[basis], sep = ", ")) |>
+  select(State, col, cell) |> pivot_wider(names_from = col, values_from = cell, values_fill = "0") |> arrange(State) |>
+  kable(caption = "Number of quarters with growth beyond ±5%; in brackets, how many coincide with SFD itself moving more than 5%")
+```
+
+Most flags are in the NT and, in current prices, WA and Queensland. Many NT flags coincide with large swings in SFD itself; the current-price flags for the mining states line up with commodity price swings feeding through goods exports. The June and September quarters of 2020 are flagged for several states. None of this proves the movements are right: it shows they have an identifiable source.
+
+## Bottom-up industry indicator {#bottom-up}
+
+```{r}
+bu <- if (file.exists(file.path(DIR_PROC, "bottom_up_test.rds"))) read_proc("bottom_up_test") else NULL
+has_bu <- !is.null(bu)
+butab <- function(b) bu$rt_tab |> filter(basis == b) |> select(-basis) |> mutate(state = factor(state, c(STATES, "Mean of 8"))) |> arrange(state)
+bum <- function(b, v) num(bu$rt_tab[[v]][bu$rt_tab$basis == b & bu$rt_tab$state == "Mean of 8"])
+```
+
+The production indicator used so far weights national quarterly industry value added by each state's industry shares from the *previous* year. A stronger use of the annual state industry data is to benchmark each state's industries directly. For every state and industry, annual value added is spread across quarters in proportion to the national quarterly series for that industry (proportional Denton). The 20 industries are then summed. The result (`bu`) matches each state's annual industry totals exactly in every benchmark year, uses that year's own industry structure, and lets each industry's state share move smoothly rather than reset each July. In the unbenchmarked year the shares are held at their last values. The test rebuilds it in every pseudo real-time vintage from only the annual data that vintage would have had.
+
+It was added to Method A as five extra indicator sets (37 candidate models instead of 20) and tried in Method B in place of the old indicator.
+
+```{r}
+#| eval: !expr has_bu
+bind_rows(butab("cvm") |> mutate(basis = "Chain volume"), butab("current") |> mutate(basis = "Current prices")) |>
+  relocate(basis) |> rename(`Price basis` = basis, State = state) |>
+  kable(digits = 2, caption = "Pseudo real-time mean absolute error of implied annual GSP (%), with and without the bottom-up indicator")
+```
+
+```{r}
+#| eval: !expr has_bu
+bu$fixed |> group_by(`Price basis` = lab_b[basis], `Indicator set (old → new)` = paste(old, "→", new)) |>
+  summarise(`MAE old (%)` = mean(mae_old), `MAE new (%)` = mean(mae_new), .groups = "drop") |>
+  kable(digits = 2, caption = "Fixed preliminary models, averaged over the four regression types and eight states")
+```
+
+```{r}
+#| eval: !expr has_bu
+bu$qld |> transmute(`Price basis` = lab_b[basis], Variant = method, Correlation = correlation, `Mean abs difference (ppt)` = mean_abs_diff,
+                    `Turning points matched` = matched_within_1q, `of` = qt_turning_points) |>
+  kable(digits = 2, caption = "Queensland quarterly growth versus Queensland Treasury, full-sample estimates")
+```
+
+**It does not help the annual estimate, and the default leaves it out.** Swapping in the bottom-up version makes almost every like-for-like indicator set less accurate: by 10–60% in current prices and by up to 26% in volumes. The exceptions are two Chow-Lin volume models, which improve by 2–5%. Method A, choosing freely among all 37 models, ends up marginally worse (`r if (has_bu) bum("cvm", "A: with bottom-up") else ""`% against `r if (has_bu) bum("cvm", "A: without bottom-up") else ""`% in volumes). Method B is worse with it in both bases (`r if (has_bu) bum("current", "B: bugap") else ""`% against `r if (has_bu) bum("current", "B: prodgap") else ""`% in current prices, with Western Australia's error rising from about 1% to 5%).
+
+**Why.** In every benchmark year the new indicator already sums to the state's annual industry value added, so in-sample it explains the annual gap almost perfectly. The models learn to trust it heavily: Method B estimates a very small measurement error. In the year being estimated it is only an extrapolation, much less accurate than the in-sample fit implied. The lagged-share indicator is equally imperfect in and out of sample, so the models weight it correctly. Commodity prices make the extrapolation worst in current prices for WA and Queensland.
+
+**Where it does help: the within-year profile of past years.** Against Queensland Treasury, Method B with the bottom-up indicator tracks current-price quarterly growth better (correlation `r if (has_bu) num(bu$qld$correlation[bu$qld$basis == "current" & bu$qld$method == "B: bugap"]) else ""` against `r if (has_bu) num(bu$qld$correlation[bu$qld$basis == "current" & bu$qld$method == "B: prodgap"]) else ""`), though it matches fewer turning points. For a historical series a hybrid would make sense: the bottom-up indicator for benchmarked years and the lagged-share indicator for nowcasts, with separate measurement errors for the two regimes. That is not built. To let Method A's selection use the bottom-up sets, set `GSP_USE_BU=true`; Method B's indicator is `MB_IND1` in `R/method_b.R`.
+
+## Method C: the mixed-frequency VAR {#method-c}
+
+```{r}
+#| eval: !expr has_c
+#| fig-height: 6
+v$growth |> filter(basis == "cvm", method %in% c("method_a", "method_b", "method_c"), date >= as.Date("2015-09-01")) |>
+  mutate(state = factor(state, STATES)) |>
+  ggplot(aes(date, growth, colour = method)) +
+  annotate("rect", xmin = unb$xmin, xmax = unb$xmax, ymin = -Inf, ymax = Inf, fill = "grey60", alpha = 0.2) +
+  geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.3) + geom_line(linewidth = 0.45) +
+  facet_wrap(~state, scales = "free_y", ncol = 4) + scale_colour_manual(values = col_m, labels = lab_m) +
+  labs(x = NULL, y = "Per cent", colour = NULL, title = "Quarterly growth in GSP, chain volume: all three methods",
+       subtitle = "Vertical axis cut at -4% and +5% so ordinary quarters are readable; 2020 runs off the scale") +
+  coord_cartesian(ylim = c(-4, 5))
+```
+
+```{r}
+#| eval: !expr has_c
+v$rt_sum |> filter(method %in% c("method_a", "method_b", "method_c", "baseline_denton")) |>
+  mutate(State = factor(state, c(STATES, "Mean of 8", "Sum of states")), col = paste(lab_m[method], lab_b[basis], sep = ", ")) |>
+  arrange(basis, method) |> select(State, col, mae) |> pivot_wider(names_from = col, values_from = mae) |> arrange(State) |>
+  kable(digits = 2, caption = "Pseudo real-time mean absolute error of implied annual GSP, per cent, including Method C")
+```
+
+```{r}
+#| eval: !expr has_c
+cmp <- v$growth |> filter(method %in% c("method_a", "method_b", "method_c"), !is.na(growth)) |>
+  select(state, basis, date, method, growth) |> pivot_wider(names_from = method, values_from = growth)
+cmp |> group_by(`Price basis` = lab_b[basis], State = factor(state, STATES)) |>
+  summarise(`s.d. of growth: A` = sd(method_a), B = sd(method_b), C = sd(method_c),
+            `Correlation C with A` = cor(method_c, method_a), `C with B` = cor(method_c, method_b),
+            `Quarters C beyond ±5%` = sum(abs(method_c) > 5), .groups = "drop") |>
+  kable(digits = 2, caption = "Quarterly growth: volatility of each method and correlation of Method C with the others")
+```
+
+```{r}
+#| eval: !expr has_c
+c_diag |> mutate(State = factor(state, STATES), basis = lab_b[basis]) |> arrange(basis, State) |>
+  select(`Price basis` = basis, State, `Kept draws` = draws, `Posterior s.d. of quarterly growth (ppt)` = post_sd_growth,
+         `Largest gap between first- and second-half means (ppt)` = halves_max_abs_diff) |>
+  kable(digits = 2, caption = "Method C sampler diagnostics")
+```
+
+`r if (has_c) paste0("In the real-time test Method C's mean absolute error is ", rtv("method_c", "cvm"), "% in volumes and ", rtv("method_c", "current"), "% in current prices, against ", rtv("method_a", "cvm"), "% and ", rtv("method_a", "current"), "% for Method A. Its correlation with Queensland Treasury's quarterly volume growth is ", num(v$qld$stats$correlation[v$qld$stats$basis == "cvm" & v$qld$stats$method == "method_c"]), " (Method A: ", num(v$qld$stats$correlation[v$qld$stats$basis == "cvm" & v$qld$stats$method == "method_a"]), ").") else "Method C has not been run (05b_method_c.R)."`
+
+How this implementation relates to Koop, McIntyre, Mitchell and Poon:
+
+- **As in the paper:** seven lags; the Mariano–Murasawa temporal weights; the cross-sectional restriction as a measurement equation with its own variance under a tight inverse-gamma prior; stochastic volatility with Σ_t⁻¹ = L′D_t⁻¹L and random-walk log-volatilities (Kim–Shephard–Chib mixture sampler); Dirichlet-Laplace priors with α = 1/2 on the VAR coefficients and on L; regional indicators entering only their own state's equation; the hyperparameters in the paper's appendix B.1.3.
+- **Different, by choice:** cross-sectional weights are previous-year GSP shares, not 1/R, because Australian states range from 1% to 31% of output. The four national macro variables (inflation, cash rate, exchange rate, oil price) are not included. Latent states are drawn with a Kalman simulation smoother instead of the precision sampler (same conditional distribution).
+- **Added:** draws of the VAR coefficients that imply an explosive system are rejected (about 3–5% of draws), and every retained draw is reconciled so both level constraints hold exactly.
+- **Chain length:** 6,000 iterations, 2,000 burn-in, every 8th kept, per price basis. The pseudo real-time test uses `r MFVAR_RT_n` iterations per vintage and reconciles the posterior mean only, which is short for a model this size; part of its error may be Monte Carlo noise. The last diagnostic column above compares the first and second half of the kept draws; gaps of 1–2 ppt show the chains have not fully settled.
+
+**Why the full specification does worse than the simpler version tried first.** The Dirichlet-Laplace prior shrinks every coefficient toward zero under one global scale, including those on SFD and hours. The estimated coefficient on own SFD growth averages about 0.05, against about 0.3 in the simpler model without that prior. SFD is the main quarterly signal about state activity, so shrinking it away leaves state paths driven by national growth and their own lags. The paper's setting has twelve regions of broadly similar size; Australian states are far more diverse and their SFD far more informative. Exempting the exogenous indicators from shrinkage, or giving them their own global scale, would be the first thing to try.
+
+## Judgement calls and caveats {#judgement-calls-and-caveats}
+
+1. **Seasonally adjusted data do not sum to annual totals in current prices**, and the latest benchmark year has a vintage mismatch. Handled by benchmarking as described above. If you would rather stop and reconcile vintages by hand each release, the check is in `output/check_sa_sums.csv`.
+2. **Smooth rather than stepped national adjustment** (`GSP_TARGET`). Annual totals are the same either way.
+3. **Chain-linked production indicator.** Using the previous year's industry shares means the weights change every September quarter. A plain weighted sum would jump at that point by the state's out- or under-performance in the previous year (on average `r num(mean(ind_diag$mean_abs_sep_step_pct[ind_diag$basis == "cvm"]), 1)`% in volumes, `r num(max(ind_diag$mean_abs_sep_step_pct), 1)`% for the worst state and basis), which would be read as growth. Growth into each quarter is therefore computed with the same weights in both quarters and cumulated. The first benchmark year (1989-90) has no earlier shares and uses its own.
+4. **Taxes less subsidies on products are not in the production indicator**, which is value-added based; the regression constant and persistent error absorb the difference.
+5. **Goods-only, self-adjusted trade indicators** and a national deflator for state trade volumes (see Data). The STL seasonal filter is two-sided, so the trade indicators in the pseudo real-time test use a little future information.
+6. **Method A model selection is noisy.** Ten out-of-sample observations per state cannot reliably rank `r length(unique(oos$model))` candidates; the models chosen differ across states for no obvious economic reason.
+7. **Reconciliation weights** use the variance of the quarterly change in each state's distributed regression residual. This is one reasonable reading of "preliminary residual variance"; other choices would shift small amounts of adjustment between states.
+8. **Method B parameters are estimated in two stages**, not by full joint maximum likelihood, to keep estimation fast and stable (about ten seconds per price basis). The intervals are conditional on the estimated parameters and treat SFD, national GDP and the annual benchmarks as known, so they are **too narrow**: they exclude parameter uncertainty, model uncertainty and ABS revisions. Adding the common factor raises the log-likelihood from `r num(b_diag$fit$loglik_no_factor[b_diag$fit$basis == "cvm"], 0)` to `r num(b_diag$fit$loglik[b_diag$fit$basis == "cvm"], 0)` in volumes.
+9. **Method B models the gap as a share of SFD.** This is still a model in levels and both constraints stay linear, but it scales the uncertainty with the size of the economy over 36 years. A redundant zero-error observation (the June cross-sectional row in benchmark years) is left out of estimation because it made the likelihood numerically erratic; the smoothed estimates still satisfy it.
+10. **Chain volume estimates are not additive.** State quarterly volumes sum to the adjusted national target, not to published national GDP, and SFD plus gap is an accounting definition rather than an additive split in volume terms.
+11. **Pseudo real-time is not real time.** It truncates today's data; ABS revisions to SFD, national GDP and annual GSP are ignored.
+12. **Baselines** meet the cross-sectional constraint exactly but the temporal one only approximately.
+13. **Method C follows the published MF-VAR-SV closely**, with the differences listed in its section. It is less accurate than Methods A and B here and is not part of the recommendation.
+
+## Recommendation {#recommendation}
+
+**Use Method A for the headline series, and publish Method B's bands with it.**
+
+- *Accuracy is a tie.* Mean absolute real-time error is `r rtv("method_a", "cvm")`% (A) against `r rtv("method_b", "cvm")`% (B) in volumes and `r rtv("method_a", "current")`% against `r rtv("method_b", "current")`% in current prices, with each method ahead in some states.
+- *Method A gives calmer quarterly profiles for the small states.* The standard deviation of quarterly volume growth for Tasmania is `r num(v$ab_sum$sd_growth_a[v$ab_sum$state == "TAS" & v$ab_sum$basis == "cvm"])` ppt under A and `r num(v$ab_sum$sd_growth_b[v$ab_sum$state == "TAS" & v$ab_sum$basis == "cvm"])` under B, and for the ACT `r num(v$ab_sum$sd_growth_a[v$ab_sum$state == "ACT" & v$ab_sum$basis == "cvm"])` against `r num(v$ab_sum$sd_growth_b[v$ab_sum$state == "ACT" & v$ab_sum$basis == "cvm"])`. With no evidence that the extra volatility in B is signal, the smoother series is the safer one to publish.
+- *Method A is the conventional approach* (regression-based temporal disaggregation followed by two-way reconciliation is what statistical agencies use), each step can be inspected separately, and its correlation with Queensland Treasury's volume growth is `r num(v$qld$stats$correlation[v$qld$stats$basis == "cvm" & v$qld$stats$method == "method_a"])` against `r num(v$qld$stats$correlation[v$qld$stats$basis == "cvm" & v$qld$stats$method == "method_b"])` for B.
+- *Method B earns its place as the companion.* It is the only source of uncertainty bands, it needs no model selection, it runs in seconds, and disagreement between the two is itself useful information: where growth rates differ by more than a percentage point, neither should be quoted with confidence.
+
+Caveats that apply to whichever you use:
+
+- The annual totals are reliable by construction; the **within-year profile is not well identified**, as the Queensland comparison shows. Prefer through-the-year or annual-average growth over single-quarter movements.
+- The latest `r n_unb` quarters are nowcasts. Expect revisions of the order of the real-time errors above (about 1% of annual GSP for a typical state, several per cent for the NT) when the next annual state accounts arrive.
+- Do not use NT or ACT quarterly growth, or current-price growth for WA and Queensland, without checking the divergence and sanity flags.
+- If you want fewer moving parts, fix one preliminary model for all states (see the selection table) instead of selecting per state.

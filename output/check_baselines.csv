@@ -1,0 +1,5 @@
+method,basis,temporal_max_rel,n_temporal,all_4q,cross_max_rel,n_cross,all_states
+baseline_denton,current,2.2328765039116163e-4,288,TRUE,4.425337247110155e-16,148,TRUE
+baseline_denton,cvm,2.2151445194245383e-4,288,TRUE,6.283606910196253e-16,148,TRUE
+baseline_prorata,current,6.66895849073986e-4,288,TRUE,5.189599650088156e-16,148,TRUE
+baseline_prorata,cvm,2.634732151733421e-4,288,TRUE,5.875080618297292e-16,148,TRUE
