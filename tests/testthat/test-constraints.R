@@ -36,9 +36,11 @@ for (m in models) for (b in BASES) {
     expect_lt(chk$cross_max_rel, TOL)
   })
 
-  test_that(paste(m, b, "unbenchmarked quarters exist and satisfy the cross-sectional constraint"), {
+  test_that(paste(m, b, "unbenchmarked quarters satisfy the cross-sectional constraint"), {
     ub <- q_target$date[q_target$basis == b & !q_target$benchmarked]
-    expect_gt(length(ub), 0)
+    # Right after an annual state accounts release and before the next national
+    # accounts, every quarter is benchmarked and there is nothing to test here.
+    if (length(ub) == 0) skip("no unbenchmarked quarters in this data release")
     s <- e |> filter(date %in% ub) |> group_by(date) |> summarise(s = sum(estimate)) |>
       inner_join(filter(q_target, basis == b), by = "date")
     expect_lt(max(abs(s$s - s$target) / s$target), TOL)
